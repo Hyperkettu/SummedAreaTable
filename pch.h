@@ -8,3 +8,6 @@
 #include <fstream>
 #include <array>
 
+#include "GraphicsAPI.h"
+#include "SummedAreaTable.h"
+
