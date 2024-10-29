@@ -1,0 +1,66 @@
+#version 450
+#extension GL_EXT_shader_8bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types : require
+
+layout(std430, binding = 0) buffer InputBuffer {
+    uint8_t inputData[];
+};
+
+layout(std430, binding = 1) buffer OutputBuffer {
+    uint8_t outputData[];
+};
+
+/*layout(std140, binding = 2) uniform Dimensions {
+    uint width;
+    uint height;
+};*/
+
+uint width = 10; 
+uint height = 10;
+
+layout(local_size_x = 16, local_size_y = 16) in;
+
+shared uint8_t sharedData[16][16];
+
+void main() {
+    uint x = gl_GlobalInvocationID.x;
+    uint y = gl_GlobalInvocationID.y;
+
+    uint index = y * width + x;
+
+    if (x >= width || y >= height) {
+        return;  
+    }
+
+    uint8_t value = uint8_t(inputData[index]);
+    sharedData[gl_LocalInvocationID.y][gl_LocalInvocationID.x] = value;
+
+    barrier();
+
+    for (uint offset = 1; offset < 16; offset *= 2) {
+        uint8_t tmp = uint8_t(0);
+        if (gl_LocalInvocationID.x >= offset) {
+            tmp = sharedData[gl_LocalInvocationID.y][gl_LocalInvocationID.x - offset];
+        }
+        barrier();
+        sharedData[gl_LocalInvocationID.y][gl_LocalInvocationID.x] += tmp;
+        barrier();
+    }
+
+    outputData[index] = sharedData[gl_LocalInvocationID.y][gl_LocalInvocationID.x];
+
+    barrier();
+
+    // Next, vertical pass (each column independently in shared memory)
+    for (uint offset = 1; offset < 16; offset *= 2) {
+        uint8_t temp = uint8_t(0);
+        if (gl_LocalInvocationID.y >= offset) {
+            temp = sharedData[gl_LocalInvocationID.y - offset][gl_LocalInvocationID.x];
+        }
+        barrier();
+        sharedData[gl_LocalInvocationID.y][gl_LocalInvocationID.x] += temp;
+        barrier();
+    }
+
+    outputData[index] = sharedData[gl_LocalInvocationID.y][gl_LocalInvocationID.x];
+}
