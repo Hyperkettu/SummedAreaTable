@@ -1,9 +1,13 @@
 #include "pch.h"
 
-// For brevity, error-checking macros
 #define VK_CHECK_RESULT(f) { VkResult res = (f); if (res != VK_SUCCESS) { \
     std::cout << "Fatal : VkResult is \"" << res << "\" in " << __FILE__ << " at line " << __LINE__ << "\n"; \
     exit(1); } }
+
+struct UniformBufferObject {
+    uint32_t width;
+    uint32_t height;
+};
 
 std::vector<uint8_t> inputData = { 
     1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
@@ -20,7 +24,6 @@ std::vector<uint8_t> inputData = {
 
 size_t SAT_WIDTH = 10;
 size_t SAT_HEIGHT = 10;
-
 
 VkInstance instance;
 VkDevice device;
@@ -39,6 +42,9 @@ uint32_t computeQueueFamilyIndex;
 
 VkBuffer outputSsbo;
 VkDeviceMemory outputSsboMemory;
+
+VkBuffer uniformBuffer;
+VkDeviceMemory uniformBufferMemory;
 
 void createInstance() {
     VkApplicationInfo appInfo = {};
@@ -68,7 +74,6 @@ void pickPhysicalDevice() {
         VkPhysicalDeviceProperties props;
         vkGetPhysicalDeviceProperties(dev, &props);
 
-        // Here you can add criteria for picking a suitable device
         if (props.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU) {
             physicalDevice = dev;
             break;
@@ -215,6 +220,46 @@ void createOutputSSBO(uint32_t dataSize) {
     vkUnmapMemory(device, outputSsboMemory);
 }
 
+uint32_t findMemoryType(uint32_t typeFilter, VkMemoryPropertyFlags properties) {
+    VkPhysicalDeviceMemoryProperties memProperties;
+    vkGetPhysicalDeviceMemoryProperties(physicalDevice, &memProperties);
+
+    for (uint32_t i = 0; i < memProperties.memoryTypeCount; i++) {
+        if ((typeFilter & (1 << i)) && (memProperties.memoryTypes[i].propertyFlags & properties) == properties) {
+            return i;
+        }
+    }
+
+    throw std::runtime_error("failed to find suitable memory type!");
+}
+
+void createBuffer(VkDevice device, VkDeviceSize size, VkBufferUsageFlags usage,
+    VkMemoryPropertyFlags properties, VkBuffer& buffer, VkDeviceMemory& bufferMemory) {
+    VkBufferCreateInfo bufferInfo{};
+    bufferInfo.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+    bufferInfo.size = size;
+    bufferInfo.usage = usage;
+    bufferInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+
+    if (vkCreateBuffer(device, &bufferInfo, nullptr, &buffer) != VK_SUCCESS) {
+        throw std::runtime_error("failed to create buffer!");
+    }
+
+    VkMemoryRequirements memRequirements;
+    vkGetBufferMemoryRequirements(device, buffer, &memRequirements);
+
+    VkMemoryAllocateInfo allocInfo{};
+    allocInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+    allocInfo.allocationSize = memRequirements.size;
+    allocInfo.memoryTypeIndex = findMemoryType(memRequirements.memoryTypeBits, properties);
+
+    if (vkAllocateMemory(device, &allocInfo, nullptr, &bufferMemory) != VK_SUCCESS) {
+        throw std::runtime_error("failed to allocate buffer memory!");
+    }
+
+    vkBindBufferMemory(device, buffer, bufferMemory, 0);
+}
+
 void createComputePipeline() {
     auto shaderCode = readFile("shaders/sat.spv");
     VkShaderModule computeShaderModule = createShaderModule(shaderCode);
@@ -225,31 +270,6 @@ void createComputePipeline() {
     shaderStageInfo.module = computeShaderModule;
     shaderStageInfo.pName = "main";
 
-    std::array<VkDescriptorSetLayoutBinding, 2> ssboLayoutBindings{};
-    ssboLayoutBindings[0].binding = 0; 
-    ssboLayoutBindings[0].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-    ssboLayoutBindings[0].descriptorCount = 1;
-    ssboLayoutBindings[0].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
-
-    ssboLayoutBindings[1].binding = 1;
-    ssboLayoutBindings[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-    ssboLayoutBindings[1].descriptorCount = 1;
-    ssboLayoutBindings[1].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
-
-    VkDescriptorSetLayoutCreateInfo layoutInfo{};
-    layoutInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-    layoutInfo.bindingCount = 2;
-    layoutInfo.pBindings = ssboLayoutBindings.data();
-
-    VK_CHECK_RESULT(vkCreateDescriptorSetLayout(device, &layoutInfo, nullptr, &descriptorSetLayout));
-
-    VkPipelineLayoutCreateInfo pipelineLayoutInfo{};
-    pipelineLayoutInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
-    pipelineLayoutInfo.setLayoutCount = 1;
-    pipelineLayoutInfo.pSetLayouts = &descriptorSetLayout;
-
-    VK_CHECK_RESULT(vkCreatePipelineLayout(device, &pipelineLayoutInfo, nullptr, &pipelineLayout));
-
     VkComputePipelineCreateInfo pipelineInfo{};
     pipelineInfo.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
     pipelineInfo.stage = shaderStageInfo;
@@ -258,6 +278,17 @@ void createComputePipeline() {
     VK_CHECK_RESULT(vkCreateComputePipelines(device, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &computePipeline));
 
     vkDestroyShaderModule(device, computeShaderModule, nullptr);
+}
+
+void updateUniformBuffer() {
+    UniformBufferObject ubo{};
+    ubo.width = SAT_WIDTH;
+    ubo.height = SAT_HEIGHT;
+
+    void* data;
+    vkMapMemory(device, uniformBufferMemory, 0, sizeof(ubo), 0, &data);
+    memcpy(data, &ubo, sizeof(ubo));
+    vkUnmapMemory(device, uniformBufferMemory);
 }
 
 void createDescriptorSets() {
@@ -273,7 +304,13 @@ void createDescriptorSets() {
     outputBinding.descriptorCount = 1;
     outputBinding.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
 
-    std::array<VkDescriptorSetLayoutBinding, 2> bindings = { inputBinding, outputBinding };
+    VkDescriptorSetLayoutBinding uniformBinding{};
+    uniformBinding.binding = 2;
+    uniformBinding.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+    uniformBinding.descriptorCount = 1;
+    uniformBinding.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+
+    std::array<VkDescriptorSetLayoutBinding, 3> bindings = { inputBinding, outputBinding, uniformBinding };
 
     VkDescriptorSetLayoutCreateInfo layoutInfo{};
     layoutInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
@@ -289,11 +326,10 @@ void createDescriptorSets() {
 
     VK_CHECK_RESULT(vkCreatePipelineLayout(device, &pipelineLayoutInfo, nullptr, &pipelineLayout));
 
-    // Descriptor Pool
-    std::array<VkDescriptorPoolSize, 2> poolSizes{};
+    std::array<VkDescriptorPoolSize, 3> poolSizes{};
     poolSizes[0].type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-    poolSizes[0].descriptorCount = 1;
-    poolSizes[1].type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    poolSizes[0].descriptorCount = 2;
+    poolSizes[1].type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
     poolSizes[1].descriptorCount = 1;
 
     VkDescriptorPoolCreateInfo poolInfo{};
@@ -322,7 +358,12 @@ void createDescriptorSets() {
     outputBufferInfo.offset = 0;
     outputBufferInfo.range = VK_WHOLE_SIZE;
 
-    std::array<VkWriteDescriptorSet, 2> descriptorWrites{};
+    VkDescriptorBufferInfo uniformBufferInfo{};
+    uniformBufferInfo.buffer = uniformBuffer;
+    uniformBufferInfo.offset = 0;
+    uniformBufferInfo.range = sizeof(UniformBufferObject);
+
+    std::array<VkWriteDescriptorSet, 3> descriptorWrites{};
 
     descriptorWrites[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
     descriptorWrites[0].dstSet = descriptorSet;
@@ -340,6 +381,15 @@ void createDescriptorSets() {
     descriptorWrites[1].descriptorCount = 1;
     descriptorWrites[1].pBufferInfo = &outputBufferInfo;
 
+    
+    descriptorWrites[2].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    descriptorWrites[2].dstSet = descriptorSet;
+    descriptorWrites[2].dstBinding = 2;
+    descriptorWrites[2].dstArrayElement = 0;
+    descriptorWrites[2].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+    descriptorWrites[2].descriptorCount = 1;
+    descriptorWrites[2].pBufferInfo = &uniformBufferInfo;
+    
     vkUpdateDescriptorSets(device, static_cast<uint32_t>(descriptorWrites.size()), descriptorWrites.data(), 0, nullptr);
 }
 
@@ -347,7 +397,7 @@ void createCommandPool() {
     VkCommandPoolCreateInfo poolInfo{};
     poolInfo.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
     poolInfo.queueFamilyIndex = computeQueueFamilyIndex;
-    poolInfo.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT; // Allows re-recording
+    poolInfo.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
 
     VK_CHECK_RESULT(vkCreateCommandPool(device, &poolInfo, nullptr, &commandPool));
 }
@@ -356,7 +406,7 @@ void allocateCommandBuffer() {
     VkCommandBufferAllocateInfo allocInfo{};
     allocInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
     allocInfo.commandPool = commandPool;
-    allocInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY; // Primary command buffer
+    allocInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
     allocInfo.commandBufferCount = 1;
 
     VK_CHECK_RESULT(vkAllocateCommandBuffers(device, &allocInfo, &commandBuffer));
@@ -365,7 +415,7 @@ void allocateCommandBuffer() {
 void recordCommandBuffer(uint32_t numElements) {
     VkCommandBufferBeginInfo beginInfo{};
     beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
-    beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT; // For one-time use
+    beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT; 
 
     VK_CHECK_RESULT(vkBeginCommandBuffer(commandBuffer, &beginInfo));
 
@@ -378,18 +428,6 @@ void recordCommandBuffer(uint32_t numElements) {
     vkCmdDispatch(commandBuffer, groupCountX, groupCountY, 1);
 
     VK_CHECK_RESULT(vkEndCommandBuffer(commandBuffer));
-}
-
-void retrieveData(uint8_t* outputArray, uint32_t dataSize) {
-    // Map the buffer memory so we can access it from the CPU
-    void* mappedMemory = nullptr;
-    VK_CHECK_RESULT(vkMapMemory(device, outputSsboMemory, 0, dataSize, 0, &mappedMemory));
-
-    // Copy the data from the mapped memory to the output array
-    memcpy(outputArray, mappedMemory, dataSize);
-
-    // Unmap the memory (not strictly necessary if using coherent memory, but good practice)
-    vkUnmapMemory(device, outputSsboMemory);
 }
 
 void retrievePrefixSum(std::vector<uint8_t>& outputData, uint32_t elementCount) {
@@ -420,8 +458,13 @@ void initVulkan(std::vector<uint8_t>& inputData) {
     createLogicalDevice();
     createSSBO(inputData);
     createOutputSSBO(inputData.size());
-    createComputePipeline();
+    createBuffer(device, sizeof(UniformBufferObject), VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
+        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+        uniformBuffer, uniformBufferMemory);
+    updateUniformBuffer();
+
     createDescriptorSets();
+    createComputePipeline();
     createCommandPool();
     allocateCommandBuffer();
 }
@@ -439,11 +482,9 @@ int main() {
 
         vkDeviceWaitIdle(device);
 
-        // Retrieve data from the SSBO
         std::vector<uint8_t> outputData(elementCount);
         retrievePrefixSum(outputData, elementCount);
 
-        // Print results
         std::cout << "Data from GPU: ";
 
         int row = 0; 
